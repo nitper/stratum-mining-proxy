@@ -74,7 +74,157 @@ class MiningSubscription(Subscription):
         on_finish callback solve the issue that job is broadcasted *during*
         the subscription request and client receive messages in wrong order.'''
         self.connection_ref().on_finish.addCallback(self._finish_after_subscribe)
-        
+
+class VersionMaskSubscription(Subscription):
+    """Each instance represents per connection version mask subscription
+
+    Note: mask may differ per connection depending on downstream configuration
+    requests
+    """
+    event = 'mining.set_version_mask'
+    # Default mask as specified by the BIP
+    version_mask = 0
+    #  By default, version rolling is not enabled. Therefore, no subscription is
+    #  possible
+    enabled = False
+
+    def __init__(self, subscriber_version_mask, **params):
+        super(VersionMaskSubscription, self).__init__(**params)
+        self.subscriber_version_mask = subscriber_version_mask
+
+    @classmethod
+    def on_new_mask(cls, version_mask):
+        """
+        :param version_mask: new mask from upstream
+        """
+        cls.version_mask = version_mask
+        cls.emit()
+
+    def get_effective_mask(self):
+        """Calculates effective version rolling mask
+
+        :return: combined masked based on mask requested by the miner
+        and mask provided by the upstream connection
+        allowed mask
+        """
+        return self.version_mask & self.subscriber_version_mask
+
+    def after_subscribe(self, *args):
+        self.emit_single()
+
+    def process(self, *args, **kwargs):
+        return ['%x' % self.get_effective_mask()]
+
+    @classmethod
+    def enable(cls):
+        cls.enabled = True
+
+
+class StratumExtension(object):
+    @classmethod
+    def configure_downstream(cls, connection_ref, values):
+        """Default implementation that generates downstream extension response
+
+        :param connection_ref: reference to the connection that demanded the
+        extension
+        :param values: values for the extension
+        :return: dictionary that indicates the extension is not available
+        """
+        return {cls.namespace: False}
+
+    @classmethod
+    def get_values(cls):
+        pass
+
+class VersionRollingExtension(StratumExtension):
+    """Version rolling extension
+    This class provides version rolling extension parameter values when
+    negotiating with upstream pool. It also provides combined version
+    rolling mask for downstream miners based on previous negotiation with the
+    pool.
+    """
+    namespace = 'version-rolling'
+
+    @classmethod
+    def _get_mask_from_values(cls, values):
+        """Extracts version mask from values dictionary
+
+        :param values: a dictinary with all extensions
+        :return: mask or throws an exception
+        """
+        mask_str = values[cls.namespace + '.mask']
+        mask = int(mask_str, 16)
+        return mask
+
+    @classmethod
+    def configure_downstream(cls, connection_ref, values):
+        """Version rolling configuration for downstream miners
+
+        :param connection_ref:
+        :param values:
+        :return:
+        :todo consider whether the result should indicate version rolling
+        disabled in case there is no intersection between the upstream mask
+        and the downstream requested mask
+        """
+        result = super(VersionRollingExtension, cls).configure_downstream(
+            connection_ref, values)
+
+        try:
+            downstream_proposed_mask = cls._get_mask_from_values(values)
+            # Only when subscription is enabled compose a valid mask
+            if VersionMaskSubscription.enabled:
+                sub = VersionMaskSubscription(downstream_proposed_mask)
+                result = {cls.namespace: True,
+                          cls.namespace + '.mask': '%x' % sub.get_effective_mask()}
+                _ = Pubsub.subscribe(connection_ref(), sub)
+        except Exception as e:
+            log.error("Version mask not calculated, error: '%s'" % e)
+
+        return result
+
+    @classmethod
+    def prepare_upstream(cls, args):
+        """Prepares version rolling extension for upstream
+        :param args: object with command line arguments
+        :return: a tuple - extension name and a dictionary with extension
+        parameter values
+        """
+        values = {
+            cls.namespace + '.mask': '%x' % args.version_rolling_mask,
+            cls.namespace + '.min-bit-count':
+                args.version_rolling_min_bit_count,
+        }
+        return cls.namespace, values
+
+    @classmethod
+    def configure_upstream(cls, values):
+        """Configure version rolling extension based on upstream response
+        A valid mask parsed from the upstream values is provided for
+        subscription only if it is non-zero
+
+        :param values: dictionary with all extensions
+        :return: nothing
+        """
+        if values.get(cls.namespace, False):
+            try:
+                upstream_proposed_mask = cls._get_mask_from_values(values)
+            except Exception as e:
+                log.error("Cannot parse upstream version mask error: '%s'" % e)
+            else:
+                if upstream_proposed_mask != 0:
+                    VersionMaskSubscription.enable()
+                    VersionMaskSubscription.on_new_mask(upstream_proposed_mask)
+                    log.info('Version rolling stratum extension enabled (mask: '
+                             '%x)' %
+                             upstream_proposed_mask)
+
+
+extensions = {
+    VersionRollingExtension.namespace: VersionRollingExtension
+}
+
+
 class StratumProxyService(GenericService):
     service_type = 'mining'
     service_vendor = 'mining_proxy'
@@ -144,7 +294,30 @@ class StratumProxyService(GenericService):
                         
         result = (yield self._f.rpc('mining.authorize', [worker_name, worker_password]))
         defer.returnValue(result)
-    
+
+    @defer.inlineCallbacks
+    def configure(self, extensions_names, extensions_values, *args):
+        """Handles configure method from downstream connections
+        A list of extensions is matched against a list of supported extensions.
+        When a matching extension is found it is provided with the parameter
+        values from downstream and a resulting configuration is collected.
+        :param extensions_names:
+        :param extensions_values:
+        :param args:
+        :return:
+        """
+        if self._f.client == None or not self._f.client.connected:
+            yield self._f.on_connect
+
+        config_result = {}
+        for ext_name in extensions_names:
+            ext = extensions.get(ext_name, None)
+            if ext is not None:
+                config_result.update(ext.configure_downstream(
+                    self.connection_ref, extensions_values))
+
+        defer.returnValue(config_result)
+
     @defer.inlineCallbacks
     def subscribe(self, *args):    
         if self._f.client == None or not self._f.client.connected:
@@ -184,9 +357,15 @@ class StratumProxyService(GenericService):
             worker_name = self.custom_user
 
         start = time.time()
-        
+        submit_params = [worker_name, job_id, tail+extranonce2, ntime, nonce]
+        # A simplified way of detecting version rolling is that we have
+        # received an additional version field and there is version mask
+        # subscription enabled
+        if len(args) == 1 and VersionMaskSubscription.enabled:
+            submit_params.append(args[0])
         try:
-            result = (yield self._f.rpc('mining.submit', [worker_name, job_id, tail+extranonce2, ntime, nonce]))
+            result = (yield self._f.rpc('mining.submit', submit_params))
+
         except RemoteServiceException as exc:
             response_time = (time.time() - start) * 1000
             log.info("[%dms] Share from '%s' REJECTED: %s" % (response_time, worker_name, str(exc)))

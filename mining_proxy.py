@@ -22,6 +22,32 @@ import time
 import os
 import socket
 
+from twisted.internet import defer
+
+
+@defer.inlineCallbacks
+def negotiate_stratum_extensions(f):
+    """
+    Negotiates stratum extensions
+
+    :param f: factory for rpc calls
+    """
+    log.info("Negotiating stratum protocol extensions")
+    extensions_names = []
+    extensions_values = {}
+    # Collect all extensions and send configure to upstream
+    for _, ext in stratum_listener.extensions.iteritems():
+        (ext_name, ext_values) = ext.prepare_upstream(args)
+        extensions_names.append(ext_name)
+        extensions_values.update(ext_values)
+
+    config_params = [extensions_names, extensions_values]
+    config_result = (yield f.rpc('mining.configure', config_params))
+    # configure all extensions based on the response from upstream
+    for _, ext in stratum_listener.extensions.iteritems():
+        ext.configure_upstream(config_result)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='This proxy allows you to run getwork-based miners against Stratum mining pool.')
     parser.add_argument('-o', '--host', dest='host', type=str, default='stratum.bitcoin.cz', help='Hostname of Stratum mining pool')
@@ -46,6 +72,28 @@ def parse_args():
     parser.add_argument('-i', '--pid-file', dest='pid_file', type=str, help='Store process pid to the file')
     parser.add_argument('-l', '--log-file', dest='log_file', type=str, help='Log to specified file')
     parser.add_argument('-st', '--scrypt-target', dest='scrypt_target', action='store_true', help='Calculate targets for scrypt algorithm')
+    default_version_rolling_mask = 0x1fffe000
+    parser.add_argument('-se', '--enable-stratum-extensions',
+                        dest='maybe_enable_stratum_extensions',
+                        action='store_const',
+                        const=negotiate_stratum_extensions,
+                        # no negotiation by default
+                        default=lambda x: None,
+                        help='Enable stratum extensions via '
+                             'mining.configure, default: DISABLED')
+    parser.add_argument('-vm', '--version-rolling-mask',
+                        dest='version_rolling_mask',
+                        type=lambda x: int(x, 16),
+                        default=default_version_rolling_mask,
+                        help='Specify hex mask for version rolling extension - '
+                             'default (%x)' % default_version_rolling_mask)
+    parser.add_argument('-vb', '--version-rolling-min-bit-count',
+                        dest='version_rolling_min_bit_count', type=int,
+                        default=2,
+                        help='Minimum number of bits requested for '
+                             'version mask when requesting version '
+                             'rolling, default (2)')
+
     return parser.parse_args()
 
 from stratum import settings
@@ -64,7 +112,7 @@ if __name__ == '__main__':
     if args.log_file:
         settings.LOGFILE = args.log_file
             
-from twisted.internet import reactor, defer
+from twisted.internet import reactor
 from stratum.socket_transport import SocketTransportFactory, SocketTransportClientFactory
 from stratum.services import ServiceEventHandler
 from twisted.web.server import Site
@@ -97,7 +145,10 @@ def on_connect(f, workers, job_registry):
     
     # Every worker have to re-autorize
     workers.clear_authorizations() 
-       
+
+    # Configure/enable stratum extensions
+    yield args.maybe_enable_stratum_extensions(f)
+
     # Subscribe for receiving jobs
     log.info("Subscribing for mining jobs")
     (_, extranonce1, extranonce2_size) = (yield f.rpc('mining.subscribe', []))[:3]

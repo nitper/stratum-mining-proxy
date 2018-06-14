@@ -70,8 +70,12 @@ class ClientMiningService(GenericEventHandler):
 
             self.job_registry.add_template(job, clean_jobs)
             
-            
-            
+        elif method == 'mining.set_version_mask':
+            version_mask = int(params[0], 16)
+            log.info("Setting version mask: %x" % version_mask)
+
+            stratum_listener.VersionMaskSubscription.on_new_mask(version_mask)
+
         elif method == 'mining.set_difficulty':
             difficulty = params[0]
             log.info("Setting new difficulty: %s" % difficulty)
