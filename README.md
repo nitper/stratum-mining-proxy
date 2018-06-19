@@ -49,12 +49,14 @@ Installation on Linux using Git
 -------------------------------
 This is advanced option for experienced users, but give you the easiest way for updating the proxy.
 
-1. git clone git://github.com/slush0/stratum-mining-proxy.git
-2. cd stratum-mining-proxy
-3. sudo apt-get install python-dev # Development package of Python are necessary
-4. sudo python distribute_setup.py # This will upgrade setuptools package
-5. sudo python setup.py develop # This will install required dependencies (namely Twisted and Stratum libraries),
-but don't install the package into the system.
+1. sudo apt-get install python-dev virtualenv # Development package and virtualenv for Python are necessary
+1. git clone git://github.com/braiins/stratum-mining-proxy.git
+1. git clone git://github.com/braiins/stratum.git
+1. cd stratum-mining-proxy
+1. virtualenv .env --python=/usr/bin/python2.7
+1. source . .env/bin/activate
+1. pip install -e ../stratum/
+1. pip install -e .
 6. You can start the proxy by typing "./mining_proxy.py" in the terminal window. Using default settings,
 proxy connects to Slush's pool interface.
 7. If you want to connect to another pool or change other proxy settings, type "./mining_proxy.py --help".
